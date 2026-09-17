@@ -1,0 +1,5 @@
+[Desktop Entry]
+Name=Blinko Kiosk
+Comment=Optical log receiver on the GigaDisplay
+Exec=/opt/blinko/blinko-kiosk-session.sh
+Type=Application
