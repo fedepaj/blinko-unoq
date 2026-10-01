@@ -12,10 +12,10 @@ blinko_kiosk.py --device /dev/video0 --exposure 2       # on the board: camera, 
 deploy/install.sh                                       # on the board: /opt/blinko + autologin session
 ```
 
-Exposure is the critical setting: the chips are 30 µs, the phones expose 15 µs. Set the
+Exposure is the critical setting: it should stay below the boards' T (60 µs by default; the phones expose 15–57 µs). Set the
 sensor's shortest exposure with `--exposure` (V4L2 `exposure_absolute`, units depend on
 the driver: `v4l2-ctl -d /dev/video0 --list-ctrls`) and, if the sensor cannot go short
-enough, use a longer chip on the boards (`chip 45`).
+enough, use a longer T on the boards (`chip 90`, with `rep 2`).
 
 Status: written against the recordings; camera and display still to be verified on the
 board (see the umbrella roadmap).
