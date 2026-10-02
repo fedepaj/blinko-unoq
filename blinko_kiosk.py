@@ -4,8 +4,10 @@ the CSI camera with the same C receiver as the phone apps and shows the console 
 
   blinko_kiosk.py                              camera (/dev/video0), fullscreen GTK UI
   blinko_kiosk.py --source rec.rsrec --headless   development: a recording, messages on stdout
-  blinko_kiosk.py --device /dev/video2 --exposure 1 --gain 4
+  blinko_kiosk.py --device /dev/video2 --exposure 1 --gain 4 --exposure-us 20 --row-us 18.5
 
+--exposure-us and --row-us describe the camera to the receiver (exposure in rows, row time);
+without them its detector assumes an exposure of half a chip. A recording brings its exposure.
 The receiver (core/) is built on first run with the system compiler (`cc`), see core/tools/rscore.py.
 """
 import argparse
@@ -31,7 +33,7 @@ PALETTE = [(1.0, 0.6, 0.15), (0.3, 0.85, 0.3), (0.3, 0.8, 1.0), (1.0, 0.4, 0.7)]
 
 
 class Console:
-    """Messages (newest first), board ids, source filter; persisted to a JSON file."""
+    """Messages (newest first), board ids, source filter; the messages are persisted to a JSON file."""
 
     def __init__(self, path, maxlen=2000):
         self.path, self.maxlen = path, maxlen
@@ -42,19 +44,29 @@ class Console:
         try:
             with open(path) as f:
                 d = json.load(f)
-            self.messages.extend(d.get("messages", [])[:maxlen])
-            self.board_ids = {int(k): v for k, v in d.get("boards", {}).items()}
+            # Source numbers are track numbers, and tracks are numbered from 1 again at every
+            # run: #1 of an earlier run is not the #1 of this one. So the table of board ids is
+            # not stored, a stored message carries the id of its own board, and its source
+            # number is dropped on loading (0: not one of this run's sources).
+            for m in d.get("messages", [])[:maxlen]:
+                m["source"] = 0
+                self.messages.append(m)
         except Exception:
             pass
 
     def add(self, slot, level, text, source):
         m = {"t": time.time(), "slot": slot, "level": level, "text": text, "source": source}
         with self.lock:
-            self.messages.appendleft(m)
             i = text.find("id=")
             if source > 0 and i >= 0 and len(text) >= i + 7:
                 self.board_ids[source] = text[i + 3:i + 7]
+            m["board"] = self.board_ids.get(source)      # None until the board has announced its id
+            self.messages.appendleft(m)
         return m
+
+    def board_of(self, m):
+        """Board id of a message: the one stored with it, else the one its source announced later."""
+        return m.get("board") or self.board_ids.get(m["source"])
 
     def visible(self):
         with self.lock:
@@ -71,7 +83,7 @@ class Console:
 
     def save(self):
         with self.lock:
-            d = {"messages": list(self.messages), "boards": {str(k): v for k, v in self.board_ids.items()}}
+            d = {"messages": [dict(m, board=self.board_of(m)) for m in self.messages]}
         try:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
             with open(self.path + ".tmp", "w") as f:
@@ -83,11 +95,12 @@ class Console:
 
 class Receiver:
     """Runs the multi-source receiver on a frame source in a thread; keeps the latest frame,
-    tracks and stats for the UI."""
+    tracks and stats for the UI. `camera` is (exposure_rows, row_seconds), 0 for what is unknown."""
 
-    def __init__(self, source, console, on_message=None):
-        self.source, self.console, self.on_message = source, console, on_message
-        self.multi = Multi()
+    def __init__(self, source, console, on_message=None, camera=(0.0, 0.0)):
+        self.source, self.console, self.on_message, self.camera = source, console, on_message, camera
+        self.multi = self.new_multi()
+        self.error = None             # why the receiver thread stopped (camera failure), for the UI
         self.latest = None            # (bgrx ndarray, w, h)
         self.tracks = []
         self.fps = 0.0
@@ -100,7 +113,22 @@ class Receiver:
     def start(self):
         self.thread.start()
 
+    def new_multi(self):
+        """A fresh receiver that knows the camera: initialising one forgets the camera description,
+        so it is given again every time (start, Clear)."""
+        m = Multi()
+        if any(self.camera):
+            m.set_camera(*self.camera)
+        return m
+
     def _run(self):
+        try:
+            self._loop()
+        except Exception as e:        # a source that fails ends the thread: say why where the user looks
+            self.error = str(e) or type(e).__name__
+            print("receiver stopped: %s" % self.error, file=sys.stderr)
+
+    def _loop(self):
         frames, pkts, t_last = 0, 0, time.time()
         for ts, a, w, h in self.source.frames():
             if self.stop:
@@ -139,6 +167,8 @@ def run_headless(receiver, console, seconds):
         pass
     receiver.stop = True
     console.save()
+    if receiver.error:
+        sys.exit(1)
 
 
 def run_gtk(receiver, console, fullscreen=True, canvas=(480, 800)):
@@ -182,7 +212,7 @@ def run_gtk(receiver, console, fullscreen=True, canvas=(480, 800)):
             return True
 
         def multi_reset(self):
-            receiver.multi = Multi()
+            receiver.multi = receiver.new_multi()
 
         def on_draw(self, widget, cr):
             cr.set_source_rgb(0.04, 0.05, 0.08); cr.paint()
@@ -222,6 +252,8 @@ def run_gtk(receiver, console, fullscreen=True, canvas=(480, 800)):
             cr.set_source_rgb(1.0, 0.45, 0.45); cr.move_to(W - 60, 26); cr.show_text("Clear")
             cr.set_source_rgb(0.6, 0.6, 0.6); cr.set_font_size(11)
             cr.move_to(8, preview_h + 34); cr.show_text("fps %.0f  pkt/s %.0f  packets %d  %s" % (receiver.fps, receiver.pkt_per_s, receiver.total_packets, receiver.source.name))
+            if receiver.error:
+                cr.set_source_rgb(1.0, 0.3, 0.3); cr.set_font_size(13); cr.move_to(8, 60); cr.show_text("stopped: " + receiver.error)
             # console
             y = preview_h + 56
             cr.set_font_size(13)
@@ -230,8 +262,9 @@ def run_gtk(receiver, console, fullscreen=True, canvas=(480, 800)):
                     break
                 lvl = LEVELS[m["level"]] if m["level"] < len(LEVELS) else "?"
                 cr.set_source_rgb(*LEVEL_COLORS.get(lvl, (1, 1, 1)))
-                head = "%s [%s]%s" % (time.strftime("%H:%M:%S", time.localtime(m["t"])), lvl,
-                                      (" #%d%s" % (m["source"], " " + console.board_ids[m["source"]] if m["source"] in console.board_ids else "")) if m["source"] else "")
+                board = console.board_of(m)
+                head = "%s [%s]%s%s" % (time.strftime("%H:%M:%S", time.localtime(m["t"])), lvl,
+                                        " #%d" % m["source"] if m["source"] else "", " " + board if board else "")
                 cr.move_to(8, y); cr.show_text(head); y += 15
                 cr.set_source_rgb(0.95, 0.95, 0.95); cr.move_to(8, y); cr.show_text(m["text"]); y += 20
             return True
@@ -253,6 +286,8 @@ def main():
     ap.add_argument("--width", type=int, default=1920); ap.add_argument("--height", type=int, default=1080)
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--exposure", help="v4l2 exposure control value (sensor units, usually lines)")
+    ap.add_argument("--exposure-us", type=float, default=0, help="exposure time in µs, for the receiver (default: the recording's own, unknown for the camera)")
+    ap.add_argument("--row-us", type=float, default=0, help="time between two rows of a frame in µs, for the receiver")
     ap.add_argument("--gain", help="v4l2 gain control value")
     ap.add_argument("--control", action="append", default=[], help="extra v4l2 control name=value")
     ap.add_argument("--headless", action="store_true"); ap.add_argument("--seconds", type=float, default=0)
@@ -271,11 +306,21 @@ def main():
             k, v = c.split("=", 1); controls[k] = v
         from sources import GstSource
         src = GstSource(a.device, a.width, a.height, a.fps, controls)
-    rx = Receiver(src, console)
+    cam = camera_description(a.exposure_us or getattr(src, "exposure_us", 0), a.row_us)
+    if not cam[0]:
+        print("exposure in rows unknown (it takes --row-us and --exposure-us or a recording): the detector assumes half a chip", file=sys.stderr)
+    rx = Receiver(src, console, camera=cam)
     if a.headless:
         run_headless(rx, console, a.seconds)
     else:
         run_gtk(rx, console, fullscreen=not a.windowed)
+
+
+def camera_description(exposure_us, row_us):
+    """(exposure_rows, row_seconds) for the receiver, 0 for what is unknown. The exposure in
+    rows takes both figures; the row time alone still lets the receiver predict the phase of a
+    light from one frame to the next."""
+    return (exposure_us / row_us if exposure_us > 0 and row_us > 0 else 0.0, row_us * 1e-6 if row_us > 0 else 0.0)
 
 
 def RecordingSourceLazy(path, realtime, loop):

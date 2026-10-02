@@ -1,5 +1,5 @@
 PY ?= python3
-.PHONY: headless replay deps
+.PHONY: headless deps
 headless:        # a recording through the receiver, messages on stdout: make headless REC=path.rsrec
 	$(PY) blinko_kiosk.py --source $(REC) --headless --fast
 deps:            # on the UNO Q
